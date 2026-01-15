@@ -1,6 +1,6 @@
 import { applyMove } from '../chess/applyMove';
 import { createGame } from './createGame';
-import { Game } from './gameTypes';
+import { Game, PlayerColor } from './gameTypes';
 
 class GameStore {
     private games = new Map<string, Game>();
@@ -13,6 +13,12 @@ class GameStore {
 
     get(gameId: string): Game | null {
         return this.games.get(gameId) ?? null;
+    }
+
+    findBySocket(socketId: string): Game | undefined {
+        return [...this.games.values()].find(
+            (g) => g.players.white?.socketId === socketId || g.players.black?.socketId === socketId
+        );
     }
 
     findGameByPlayerId(playerId: string): Game | undefined {
@@ -87,6 +93,31 @@ class GameStore {
         if (!success) return null;
 
         return game;
+    }
+
+    endGame(game: Game, winner: PlayerColor, reason: Game['endReason']) {
+        game.status = 'ended';
+        game.winner = winner;
+        game.endReason = reason;
+
+        if (game.disconnectTimer) {
+            clearTimeout(game.disconnectTimer);
+            game.disconnectTimer = undefined;
+        }
+    }
+
+    startDisconnectTimer(game: Game, disconnectedColor: PlayerColor, onForfeit: () => void) {
+        if (game.disconnectTimer) return;
+
+        game.disconnectTimer = setTimeout(() => {
+            onForfeit();
+        }, 30_000); // ⏱ 30 seconds
+    }
+
+    cancelDisconnectTimer(game: Game) {
+        if (!game.disconnectTimer) return;
+        clearTimeout(game.disconnectTimer);
+        game.disconnectTimer = undefined;
     }
 }
 

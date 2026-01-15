@@ -43,5 +43,8 @@ export interface Game {
     winner?: PlayerColor;
     endReason?: GameEndReason;
 
+    // Disconnect handling
+    disconnectTimer?: NodeJS.Timeout;
+
     createdAt: number;
 }
