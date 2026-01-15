@@ -45,6 +45,8 @@ export interface Game {
 
     // Disconnect handling
     disconnectTimer?: NodeJS.Timeout;
+    disconnectedColor?: PlayerColor;
+    disconnectDeadline?: number;
 
     createdAt: number;
 }

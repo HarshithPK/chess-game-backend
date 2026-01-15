@@ -7,7 +7,7 @@ import { hasAnyLegalMoves, isKingInCheck } from './chess/moveUtils';
 
 import { ENV } from './config/env';
 
-const DISCONNECT_TIMEOUT = 30_000; // 30 seconds
+const DISCONNECT_TIMEOUT = ENV.DISCONNECT_TIMEOUT;
 
 export function initSocket(server: HttpServer) {
     const io = new Server(server, {
@@ -44,11 +44,14 @@ export function initSocket(server: HttpServer) {
 
                 socket.join(existingGame.id);
 
-                // 🛑 Cancel disconnect forfeit
+                // Cancel disconnect forfeit + clear state
                 if (existingGame.disconnectTimer) {
                     clearTimeout(existingGame.disconnectTimer);
                     existingGame.disconnectTimer = undefined;
                 }
+
+                existingGame.disconnectedColor = undefined;
+                existingGame.disconnectDeadline = undefined;
 
                 socket.emit('game:reconnected', existingGame);
 
@@ -189,17 +192,17 @@ export function initSocket(server: HttpServer) {
             const disconnectedColor =
                 game.players.white?.socketId === socket.id ? 'white' : 'black';
 
-            console.log(`[DISCONNECT] ${disconnectedColor} disconnected from ${currentGameId}`);
+            game.disconnectedColor = disconnectedColor;
+            game.disconnectDeadline = Date.now() + DISCONNECT_TIMEOUT;
 
-            // ⏱ Start forfeit timer
+            io.to(currentGameId).emit('game:update', game);
+
             game.disconnectTimer = setTimeout(() => {
                 game.status = 'ended';
                 game.endReason = 'disconnect';
                 game.winner = disconnectedColor === 'white' ? 'black' : 'white';
 
                 io.to(currentGameId!).emit('game:update', game);
-
-                console.log('[FORFEIT]', currentGameId);
             }, DISCONNECT_TIMEOUT);
         });
     });
