@@ -89,7 +89,6 @@ export function initSocket(server: HttpServer) {
         socket.on('game:move', ({ gameId, from, to }) => {
             const game = gameStore.get(gameId);
             if (!game || game.status !== 'active') return;
-
             if (game.pendingPromotion) return;
 
             const player =
@@ -120,19 +119,75 @@ export function initSocket(server: HttpServer) {
                 return;
             }
 
-            // NORMAL MOVE
-            const nextPlayer = game.turn;
+            /** ✅ SWITCH TURN HERE */
+            const nextPlayer = player === 'white' ? 'black' : 'white';
+            game.turn = nextPlayer;
 
+            /** ✅ CHECK CHECKMATE FOR NEXT PLAYER */
             if (
                 isKingInCheck(game.board, nextPlayer) &&
                 !hasAnyLegalMoves(game.board, nextPlayer)
             ) {
                 game.status = 'ended';
-                game.winner = nextPlayer === 'white' ? 'black' : 'white';
+                game.winner = player;
                 game.endReason = 'checkmate';
             }
 
             io.to(gameId).emit('game:update', game);
+        });
+
+        /** JOIN OR SPECTATE GAME */
+        socket.on('game:joinOrSpectate', (gameId: string) => {
+            const game = gameStore.get(gameId);
+
+            if (!game) {
+                socket.emit('game:error', 'Game not found');
+                return;
+            }
+
+            /* ===== RECONNECT AS PLAYER ===== */
+            const white = game.players.white;
+            const black = game.players.black;
+
+            if (white?.playerId === playerId) {
+                white.socketId = socket.id;
+                currentGameId = game.id;
+
+                socket.join(game.id);
+                socket.emit('game:reconnected', game);
+                return;
+            }
+
+            if (black?.playerId === playerId) {
+                black.socketId = socket.id;
+                currentGameId = game.id;
+
+                socket.join(game.id);
+                socket.emit('game:reconnected', game);
+                return;
+            }
+
+            /* ===== JOIN AS SECOND PLAYER ===== */
+            if (game.status === 'waiting') {
+                const joined = gameStore.join(game.id, socket.id, playerId);
+
+                if (!joined) {
+                    socket.emit('game:error', 'Unable to join game');
+                    return;
+                }
+
+                game.status = 'active';
+                currentGameId = game.id;
+
+                socket.join(game.id);
+                io.to(game.id).emit('game:joined', game);
+                return;
+            }
+
+            /* ===== SPECTATOR ===== */
+            currentGameId = game.id;
+            socket.join(game.id);
+            socket.emit('game:spectating', game);
         });
 
         /* ========= PROMOTION ========= */
@@ -178,7 +233,7 @@ export function initSocket(server: HttpServer) {
         });
 
         /* ========= JOIN AS SPECTATOR ========= */
-        socket.on('game:spactate', (gameId: string) => {
+        socket.on('game:spectate', (gameId: string) => {
             const game = gameStore.get(gameId);
 
             if (!game) {
