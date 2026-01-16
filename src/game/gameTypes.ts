@@ -37,11 +37,13 @@ export interface Game {
     board: BoardState;
     turn: PlayerColor;
 
+    spectators: any[];
+
     enPassantTarget: number | null;
     pendingPromotion: PendingPromotion | null;
 
-    winner?: PlayerColor;
-    endReason?: GameEndReason;
+    winner?: PlayerColor | null;
+    endReason?: GameEndReason | null;
 
     // Disconnect handling
     disconnectTimer?: NodeJS.Timeout;

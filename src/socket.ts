@@ -36,28 +36,25 @@ export function initSocket(server: HttpServer) {
             const player =
                 existingGame.players.white?.playerId === playerId
                     ? existingGame.players.white
-                    : existingGame.players.black;
+                    : existingGame.players.black?.playerId === playerId
+                      ? existingGame.players.black
+                      : null;
 
-            if (player) {
-                player.socketId = socket.id;
-                currentGameId = existingGame.id;
+            if (!player) return;
 
-                socket.join(existingGame.id);
+            player.socketId = socket.id;
+            currentGameId = existingGame.id;
 
-                // Cancel disconnect forfeit + clear state
-                if (existingGame.disconnectTimer) {
-                    clearTimeout(existingGame.disconnectTimer);
-                    existingGame.disconnectTimer = undefined;
-                }
-
-                existingGame.disconnectedColor = undefined;
-                existingGame.disconnectDeadline = undefined;
-
-                socket.emit('game:reconnected', existingGame);
-
-                console.log('[RECONNECTED]', existingGame.id, player.color);
-            }
+            socket.join(existingGame.id);
+            socket.emit('game:reconnected', existingGame);
         }
+
+        /* ========= GET GAME STATE ========= */
+        socket.on('game:state', (gameId: string) => {
+            const game = gameStore.get(gameId);
+            if (!game) return;
+            socket.emit('game:state', game);
+        });
 
         /* ========= CREATE PRIVATE GAME ========= */
         socket.on('game:create', () => {
@@ -178,6 +175,21 @@ export function initSocket(server: HttpServer) {
             game.winner = isWhite ? 'black' : 'white';
 
             io.to(gameId).emit('game:update', game);
+        });
+
+        /* ========= JOIN AS SPECTATOR ========= */
+        socket.on('game:spactate', (gameId: string) => {
+            const game = gameStore.get(gameId);
+
+            if (!game) {
+                socket.emit('game:error', 'Game not found');
+                return;
+            }
+
+            socket.join(game.id);
+            socket.emit('game:spectating', game);
+
+            console.log(`[SPECTATOR JOINED]`, game.id, socket.id);
         });
 
         /* ========= DISCONNECT (GRACEFUL) ========= */

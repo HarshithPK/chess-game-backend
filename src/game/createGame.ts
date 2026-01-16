@@ -1,27 +1,37 @@
+import { nanoid } from 'nanoid';
 import { createInitialBoard } from '../chess/createInitialBoard';
-import { generateGameId } from '../utils/generateId';
 import { Game } from './gameTypes';
-import { initialBoard } from './initialBoard';
 
 export function createGame(socketId: string, playerId: string): Game {
     return {
-        id: generateGameId(),
+        id: nanoid(6),
+        board: createInitialBoard(),
+        turn: 'white',
         status: 'waiting',
 
         players: {
             white: {
                 socketId,
-                playerId,
+                playerId, // 🔑 THIS IS CRITICAL
                 color: 'white',
             },
+            black: undefined,
         },
 
-        // AUTHORITATIVE GAME STATE
-        board: createInitialBoard(),
-        turn: 'white',
-        enPassantTarget: null,
+        spectators: [],
         pendingPromotion: null,
 
+        // game-end state
+        winner: null,
+        endReason: null,
+
+        // disconnect handling
+        disconnectTimer: undefined,
+        disconnectedColor: undefined,
+        disconnectDeadline: undefined,
+
+        // additional game state
+        enPassantTarget: null,
         createdAt: Date.now(),
     };
 }
