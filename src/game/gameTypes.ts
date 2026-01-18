@@ -1,3 +1,5 @@
+import { GameAnalysis } from '../engine/postGameAnalysis';
+
 export type PlayerColor = 'white' | 'black';
 export type PieceType = 'pawn' | 'rook' | 'knight' | 'bishop' | 'queen' | 'king';
 export type GameEndReason =
@@ -7,9 +9,19 @@ export type GameEndReason =
     | 'stalemate'
     | 'threefold'
     | 'fifty-move'
-    | 'insufficient-material';
+    | 'insufficient-material'
+    | 'timeout';
 export type GameStatus = 'waiting' | 'active' | 'ended';
 export type BoardState = Square[];
+
+export type MoveAnnotation = '!!' | '!' | '!?' | '?!' | '?' | '??' | null;
+
+export interface GameClock {
+    white: number; // milliseconds
+    black: number; // milliseconds
+    lastMoveAt: number; // timestamp
+    increment: number; // ms
+}
 
 export interface Player {
     socketId: string;
@@ -64,9 +76,14 @@ export interface Game {
     disconnectedColor?: PlayerColor;
     disconnectDeadline?: number;
 
+    analysis?: GameAnalysis;
+
     createdAt: number;
 
     moveHistory: MoveRecord[];
+
+    // Clock
+    clock?: GameClock;
 }
 
 export interface MoveRecord {
@@ -86,4 +103,10 @@ export interface MoveRecord {
 
     boardHash: string;
     halfMoveClock: number;
+
+    annotation?: MoveAnnotation;
+
+    // 🧠 Stockfish analysis (post-game)
+    evalBefore?: number;
+    evalAfter?: number;
 }

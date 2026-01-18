@@ -7,9 +7,15 @@ import { hasAnyLegalMoves, isKingInCheck } from '../chess/moveUtils';
 import { getPositionHash } from '../chess/positionHash';
 import { generateSAN } from '../chess/generateSan';
 import { generatePGN } from '../chess/generatePGN';
-import { isInsufficientMaterial } from '../chess/insufficientMaterial';
+import { isInsufficientMaterial } from '../chess/isInsufficientMaterial';
+import { boardToFEN } from '../chess/boardToFen';
+import { createClock } from '../game/timeControls';
+
+import { getEngine, releaseEngine } from '../engine/enginePool';
+import { analyzeGame } from '../engine/postGameAnalysis';
 
 import { ENV } from '../config/env';
+import { applyClock, checkTimeout } from '../game/clockUtils';
 
 const DISCONNECT_TIMEOUT = ENV.DISCONNECT_TIMEOUT;
 
@@ -30,7 +36,7 @@ export function initSocket(server: HttpServer) {
 
         let currentGameId: string | null = null;
 
-        /* ========= RECONNECT SUPPORT ========= */
+        /* ========= RECONNECT ========= */
         const existingGame = gameStore.findGameByPlayerId(playerId);
         if (existingGame) {
             const player =
@@ -44,19 +50,21 @@ export function initSocket(server: HttpServer) {
 
             player.socketId = socket.id;
             currentGameId = existingGame.id;
+
             socket.join(existingGame.id);
             socket.emit('game:reconnected', existingGame);
         }
 
-        /* ========= GET GAME STATE ========= */
+        /* ========= STATE ========= */
         socket.on('game:state', (gameId: string) => {
             const game = gameStore.get(gameId);
             if (game) socket.emit('game:state', game);
         });
 
-        /* ========= CREATE GAME ========= */
+        /* ========= CREATE ========= */
         socket.on('game:create', () => {
             const game = gameStore.create(socket.id, playerId);
+            game.clock = createClock('5+0'); // default for now
             currentGameId = game.id;
 
             const hash = getPositionHash(game.board, game.turn, game.enPassantTarget);
@@ -66,7 +74,7 @@ export function initSocket(server: HttpServer) {
             socket.emit('game:created', game);
         });
 
-        /* ========= JOIN GAME ========= */
+        /* ========= JOIN ========= */
         socket.on('game:join', (gameId: string) => {
             const game = gameStore.join(gameId, socket.id, playerId);
             if (!game) {
@@ -99,10 +107,22 @@ export function initSocket(server: HttpServer) {
 
             if (player !== game.turn) return;
 
+            applyClock(game, player);
+
+            const timedOut = checkTimeout(game);
+            if (timedOut) {
+                game.status = 'ended';
+                game.endReason = 'timeout';
+                game.winner = timedOut === 'white' ? 'black' : 'white';
+
+                releaseEngine(game.id);
+                io.to(gameId).emit('game:update', game);
+                return;
+            }
+
             const movingPiece = game.board[from].piece;
             const capturedPiece = game.board[to].piece ?? null;
 
-            // ✅ capture board BEFORE move
             const boardBefore = game.board.map((sq) => ({ piece: sq.piece }));
 
             const result = applyMove(game, from, to);
@@ -116,14 +136,12 @@ export function initSocket(server: HttpServer) {
                 game.pendingPromotion = {
                     index: result.index,
                     color: player,
-                    from, // ✅ store pawn origin
+                    from,
                 };
-
                 socket.emit('game:promotionRequired', { index: result.index });
                 return;
             }
 
-            /** ♟️ RECORD MOVE */
             const san = generateSAN(boardBefore, game.board, {
                 from,
                 to,
@@ -144,49 +162,52 @@ export function initSocket(server: HttpServer) {
                 halfMoveClock: game.halfMoveClock,
             });
 
-            /** ✅ SWITCH TURN */
             const nextPlayer = player === 'white' ? 'black' : 'white';
             game.turn = nextPlayer;
 
-            /** 🔁 THREEFOLD REPETITION */
             const hash = getPositionHash(game.board, game.turn, game.enPassantTarget);
             game.positionHistory[hash] = (game.positionHistory[hash] ?? 0) + 1;
 
+            const endGame = async (winner: 'white' | 'black' | null, reason: any) => {
+                game.status = 'ended';
+                game.winner = winner;
+                game.endReason = reason;
+
+                releaseEngine(game.id);
+                game.analysis = await analyzeGame(game);
+
+                io.to(gameId).emit('game:update', game);
+            };
+
             if (game.positionHistory[hash] >= 3) {
-                game.status = 'ended';
-                game.winner = null;
-                game.endReason = 'threefold';
-                io.to(gameId).emit('game:update', game);
+                endGame(null, 'threefold');
                 return;
             }
 
-            /** ♟️ 50-MOVE RULE */
             if (game.halfMoveClock >= 100) {
-                game.status = 'ended';
-                game.winner = null;
-                game.endReason = 'fifty-move';
-                io.to(gameId).emit('game:update', game);
+                endGame(null, 'fifty-move');
                 return;
             }
 
-            /** ♟️ INSUFFICIENT MATERIAL */
             if (isInsufficientMaterial(game.board)) {
-                game.status = 'ended';
-                game.winner = null;
-                game.endReason = 'insufficient-material';
-                io.to(gameId).emit('game:update', game);
+                endGame(null, 'insufficient-material');
                 return;
             }
 
-            /** ✅ CHECKMATE / STALEMATE */
             const inCheck = isKingInCheck(game.board, nextPlayer);
             const hasMoves = hasAnyLegalMoves(game.board, nextPlayer, game.enPassantTarget);
 
             if (!hasMoves) {
-                game.status = 'ended';
-                game.winner = inCheck ? player : null;
-                game.endReason = inCheck ? 'checkmate' : 'stalemate';
+                endGame(inCheck ? player : null, inCheck ? 'checkmate' : 'stalemate');
+                return;
             }
+
+            const fen = boardToFEN(game.board, game.turn, game.enPassantTarget);
+            const engine = getEngine(game.id);
+
+            engine.evaluate(fen).then((evalResult) => {
+                io.to(game.id).emit('game:engineEval', evalResult);
+            });
 
             io.to(gameId).emit('game:update', game);
         });
@@ -204,7 +225,6 @@ export function initSocket(server: HttpServer) {
 
             if (!isCorrectPlayer) return;
 
-            // board before promotion
             const boardBefore = game.board.map((sq) => ({ piece: sq.piece }));
 
             game.board[index].piece = {
@@ -215,7 +235,6 @@ export function initSocket(server: HttpServer) {
 
             game.pendingPromotion = null;
 
-            /** ♟️ RECORD PROMOTION */
             const san = generateSAN(boardBefore, game.board, {
                 from,
                 to: index,
@@ -237,55 +256,58 @@ export function initSocket(server: HttpServer) {
                 halfMoveClock: game.halfMoveClock,
             });
 
-            /** ✅ SWITCH TURN */
             const nextPlayer = color === 'white' ? 'black' : 'white';
             game.turn = nextPlayer;
 
-            /** 🔁 THREEFOLD REPETITION */
             const hash = getPositionHash(game.board, game.turn, game.enPassantTarget);
             game.positionHistory[hash] = (game.positionHistory[hash] ?? 0) + 1;
 
+            const endGame = async (winner: 'white' | 'black' | null, reason: any) => {
+                game.status = 'ended';
+                game.winner = winner;
+                game.endReason = reason;
+
+                releaseEngine(game.id);
+                game.analysis = await analyzeGame(game);
+
+                io.to(gameId).emit('game:update', game);
+            };
+
             if (game.positionHistory[hash] >= 3) {
-                game.status = 'ended';
-                game.winner = null;
-                game.endReason = 'threefold';
-                io.to(gameId).emit('game:update', game);
+                endGame(null, 'threefold');
                 return;
             }
 
-            /** ♟️ 50-MOVE RULE */
             if (game.halfMoveClock >= 100) {
-                game.status = 'ended';
-                game.winner = null;
-                game.endReason = 'fifty-move';
-                io.to(gameId).emit('game:update', game);
+                endGame(null, 'fifty-move');
                 return;
             }
 
-            /** ♟️ INSUFFICIENT MATERIAL */
             if (isInsufficientMaterial(game.board)) {
-                game.status = 'ended';
-                game.winner = null;
-                game.endReason = 'insufficient-material';
-                io.to(gameId).emit('game:update', game);
+                endGame(null, 'insufficient-material');
                 return;
             }
 
-            /** ✅ CHECKMATE / STALEMATE */
             const inCheck = isKingInCheck(game.board, nextPlayer);
             const hasMoves = hasAnyLegalMoves(game.board, nextPlayer, game.enPassantTarget);
 
             if (!hasMoves) {
-                game.status = 'ended';
-                game.winner = inCheck ? color : null;
-                game.endReason = inCheck ? 'checkmate' : 'stalemate';
+                endGame(inCheck ? color : null, inCheck ? 'checkmate' : 'stalemate');
+                return;
             }
+
+            const fen = boardToFEN(game.board, game.turn, game.enPassantTarget);
+            const engine = getEngine(game.id);
+
+            engine.evaluate(fen).then((evalResult) => {
+                io.to(game.id).emit('game:engineEval', evalResult);
+            });
 
             io.to(gameId).emit('game:update', game);
         });
 
         /* ========= RESIGN ========= */
-        socket.on('game:resign', ({ gameId }) => {
+        socket.on('game:resign', async ({ gameId }) => {
             const game = gameStore.get(gameId);
             if (!game || game.status !== 'active') return;
 
@@ -297,16 +319,16 @@ export function initSocket(server: HttpServer) {
             game.endReason = 'resign';
             game.winner = isWhite ? 'black' : 'white';
 
+            releaseEngine(game.id);
+            game.analysis = await analyzeGame(game);
+
             io.to(gameId).emit('game:update', game);
         });
 
-        /* ========= SPECTATE ========= */
-        socket.on('game:spectate', (gameId: string) => {
+        /* ========= PGN ========= */
+        socket.on('game:pgn', (gameId: string) => {
             const game = gameStore.get(gameId);
-            if (!game) return;
-
-            socket.join(game.id);
-            socket.emit('game:spectating', game);
+            if (game) socket.emit('game:pgn', generatePGN(game));
         });
 
         /* ========= DISCONNECT ========= */
@@ -324,21 +346,16 @@ export function initSocket(server: HttpServer) {
 
             io.to(currentGameId).emit('game:update', game);
 
-            game.disconnectTimer = setTimeout(() => {
+            game.disconnectTimer = setTimeout(async () => {
                 game.status = 'ended';
                 game.endReason = 'disconnect';
                 game.winner = disconnectedColor === 'white' ? 'black' : 'white';
+
+                releaseEngine(game.id);
+                game.analysis = await analyzeGame(game);
+
                 io.to(currentGameId!).emit('game:update', game);
             }, DISCONNECT_TIMEOUT);
-        });
-
-        /* ========= EXPORT MOVES PNG ========= */
-        socket.on('game:pgn', (gameId: string) => {
-            const game = gameStore.get(gameId);
-            if (!game) return;
-
-            const pgn = generatePGN(game);
-            socket.emit('game:pgn', pgn);
         });
     });
 }
