@@ -25,6 +25,12 @@ export function createGame(socketId: string, playerId: string): Game {
         winner: null,
         endReason: null,
 
+        // threefold stalemate
+        positionHistory: {},
+
+        // 50 Move Rule
+        halfMoveClock: 0,
+
         // disconnect handling
         disconnectTimer: undefined,
         disconnectedColor: undefined,
@@ -33,5 +39,7 @@ export function createGame(socketId: string, playerId: string): Game {
         // additional game state
         enPassantTarget: null,
         createdAt: Date.now(),
+
+        moveHistory: [],
     };
 }

@@ -114,12 +114,16 @@ export function isKingInCheck(board: BoardState, color: Color): boolean {
    CHECKMATE / STALEMATE HELPERS
 ===================================================== */
 
-export function hasAnyLegalMoves(board: BoardState, color: Color): boolean {
+export function hasAnyLegalMoves(
+    board: BoardState,
+    color: Color,
+    enPassantTarget: number | null
+): boolean {
     for (let i = 0; i < board.length; i++) {
         const piece = board[i].piece;
         if (!piece || piece.color !== color) continue;
 
-        if (getLegalMoves(board, i).length > 0) {
+        if (getLegalMoves(board, i, enPassantTarget).length > 0) {
             return true;
         }
     }
@@ -168,7 +172,7 @@ function getPseudoMoves(board: BoardState, fromIndex: number): Move[] {
         case 'knight':
             return knightMoves(board, piece.color, row, col);
         case 'king':
-            return kingMoves(board, piece.color, row, col, true);
+            return kingMoves(board, piece.color, row, col, true); // ⚠️ attack-only
         default:
             return [];
     }
@@ -189,14 +193,12 @@ function pawnMoves(
     const startRow = piece.color === 'white' ? 6 : 1;
     const moves: Move[] = [];
 
-    // ─── Single move ─────────────────────────────
     const oneForward = row + dir;
     if (isInsideBoard(oneForward, col)) {
         const idx = rcToIndex(oneForward, col);
         if (!board[idx].piece) {
             moves.push({ index: idx, capture: false });
 
-            // ─── Double move (first move only) ──────
             if (row === startRow) {
                 const twoForward = row + dir * 2;
                 const idx2 = rcToIndex(twoForward, col);
@@ -211,7 +213,6 @@ function pawnMoves(
         }
     }
 
-    // ─── Normal captures ─────────────────────────
     for (const dc of [-1, 1]) {
         const r = row + dir;
         const c = col + dc;
@@ -224,7 +225,6 @@ function pawnMoves(
         }
     }
 
-    // ─── En Passant capture ──────────────────────
     if (enPassantTarget !== null) {
         for (const dc of [-1, 1]) {
             const sideCol = col + dc;
@@ -324,7 +324,7 @@ function kingMoves(
 ): Move[] {
     const moves: Move[] = [];
 
-    // Normal moves
+    // ✅ King step moves (always allowed)
     for (let dr = -1; dr <= 1; dr++) {
         for (let dc = -1; dc <= 1; dc++) {
             if (dr === 0 && dc === 0) continue;
@@ -342,18 +342,22 @@ function kingMoves(
         }
     }
 
+    // 🚨 IMPORTANT FIX:
+    // When detecting attacks, king does NOT consider castling
+    if (ignoreCheck) {
+        return moves;
+    }
+
     const kingIndex = rcToIndex(row, col);
     const king = board[kingIndex].piece;
     if (!king || king.hasMoved) return moves;
 
-    if (!ignoreCheck && isKingInCheck(board, color)) return moves;
+    if (isKingInCheck(board, color)) return moves;
 
-    // King-side castling
     if (canCastleThrough(board, color, row, [5, 6])) {
         moves.push({ index: rcToIndex(row, 6), capture: false, castle: 'king' });
     }
 
-    // Queen-side castling
     if (canCastleThrough(board, color, row, [3, 2])) {
         moves.push({ index: rcToIndex(row, 2), capture: false, castle: 'queen' });
     }
@@ -388,7 +392,7 @@ function simulateMove(
 ): BoardState {
     const newBoard = board.map((sq) => ({ piece: sq.piece }));
 
-    newBoard[to].piece = newBoard[from].piece;
+    newBoard[to].piece = newBoard[from].piece ? { ...newBoard[from].piece! } : null;
     newBoard[from].piece = null;
 
     if (castle) {

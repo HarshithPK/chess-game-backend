@@ -18,6 +18,15 @@ export function applyMove(game: Game, from: number, to: number): ApplyMoveResult
 
     if (!move) return { type: 'invalid' };
 
+    const isPawnMove = piece.type === 'pawn';
+    const isCapture = move.capture === true || move.enPassant !== undefined;
+
+    if (isPawnMove || isCapture) {
+        game.halfMoveClock = 0;
+    } else {
+        game.halfMoveClock += 1;
+    }
+
     // ─── En Passant ─────────────────────────────
     if (move.enPassant !== undefined) {
         board[move.enPassant].piece = null;
@@ -58,9 +67,6 @@ export function applyMove(game: Game, from: number, to: number): ApplyMoveResult
             index: to,
         };
     }
-
-    // ─── Switch turn ───────────────────────────
-    game.turn = game.turn === 'white' ? 'black' : 'white';
 
     return { type: 'normal' };
 }

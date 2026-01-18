@@ -1,6 +1,13 @@
 export type PlayerColor = 'white' | 'black';
 export type PieceType = 'pawn' | 'rook' | 'knight' | 'bishop' | 'queen' | 'king';
-export type GameEndReason = 'checkmate' | 'disconnect' | 'resign';
+export type GameEndReason =
+    | 'checkmate'
+    | 'disconnect'
+    | 'resign'
+    | 'stalemate'
+    | 'threefold'
+    | 'fifty-move'
+    | 'insufficient-material';
 export type GameStatus = 'waiting' | 'active' | 'ended';
 export type BoardState = Square[];
 
@@ -23,6 +30,7 @@ export interface Square {
 export interface PendingPromotion {
     index: number;
     color: PlayerColor;
+    from: number;
 }
 
 export interface Game {
@@ -45,10 +53,37 @@ export interface Game {
     winner?: PlayerColor | null;
     endReason?: GameEndReason | null;
 
+    // 🔁 Threefold repetition
+    positionHistory: Record<string, number>;
+
+    // 50 Move Rule
+    halfMoveClock: number;
+
     // Disconnect handling
     disconnectTimer?: NodeJS.Timeout;
     disconnectedColor?: PlayerColor;
     disconnectDeadline?: number;
 
     createdAt: number;
+
+    moveHistory: MoveRecord[];
+}
+
+export interface MoveRecord {
+    from: number;
+    to: number;
+    piece: PieceType;
+    color: PlayerColor;
+
+    capture: boolean;
+    capturedPiece?: PieceType;
+
+    promotion?: PieceType;
+    castle?: 'king' | 'queen';
+    enPassant?: number;
+
+    san?: string;
+
+    boardHash: string;
+    halfMoveClock: number;
 }
