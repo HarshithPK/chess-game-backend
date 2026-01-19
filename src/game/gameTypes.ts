@@ -24,7 +24,7 @@ export interface GameClock {
 }
 
 export interface Player {
-    socketId: string;
+    socketId: string | null;
     playerId: string;
     color: PlayerColor;
 }
@@ -84,6 +84,7 @@ export interface Game {
 
     // Clock
     clock?: GameClock;
+    timeControl: string;
 }
 
 export interface MoveRecord {

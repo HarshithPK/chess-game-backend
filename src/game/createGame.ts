@@ -1,8 +1,14 @@
 import { nanoid } from 'nanoid';
+
 import { createInitialBoard } from '../chess/createInitialBoard';
 import { Game } from './gameTypes';
+import { createClock, TimeControl } from './timeControls';
 
-export function createGame(socketId: string, playerId: string): Game {
+export function createGame(
+    socketId: string,
+    playerId: string,
+    timeControl: TimeControl = '5+0'
+): Game {
     return {
         id: nanoid(6),
         board: createInitialBoard(),
@@ -39,6 +45,9 @@ export function createGame(socketId: string, playerId: string): Game {
         // additional game state
         enPassantTarget: null,
         createdAt: Date.now(),
+
+        clock: createClock(timeControl),
+        timeControl, // ✅
 
         moveHistory: [],
     };

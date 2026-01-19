@@ -1,4 +1,5 @@
 import { applyMove } from '../chess/applyMove';
+import { createInitialBoard } from '../chess/createInitialBoard';
 import { createGame } from './createGame';
 import { Game, PlayerColor } from './gameTypes';
 
@@ -118,6 +119,55 @@ class GameStore {
         if (!game.disconnectTimer) return;
         clearTimeout(game.disconnectTimer);
         game.disconnectTimer = undefined;
+    }
+
+    restore({
+        id,
+        whiteUserId,
+        blackUserId,
+        timeControl,
+        clock,
+    }: {
+        id: string;
+        whiteUserId: string;
+        blackUserId: string | null;
+        timeControl: string;
+        clock: any;
+    }): Game {
+        const game: Game = {
+            id,
+            status: 'active',
+
+            players: {
+                white: {
+                    playerId: whiteUserId,
+                    socketId: null,
+                    color: 'white',
+                },
+                black: blackUserId
+                    ? { playerId: blackUserId, socketId: null, color: 'black' }
+                    : undefined,
+            },
+
+            board: createInitialBoard(),
+            turn: 'white',
+
+            enPassantTarget: null,
+            halfMoveClock: 0,
+            pendingPromotion: null,
+
+            positionHistory: {},
+            moveHistory: [],
+            spectators: [],
+
+            clock,
+            timeControl,
+
+            createdAt: Date.now(),
+        };
+
+        this.games.set(id, game);
+        return game;
     }
 }
 
