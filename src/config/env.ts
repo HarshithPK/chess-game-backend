@@ -41,7 +41,7 @@ export const ENV = {
 
     /* ===== MATCHMAKING ===== */
     MATCHMAKING: {
-        TIMEOUT: Number(requireEnv('MATCHMAKING_TIMEOUT_MS', '30_000')),
+        TIMEOUT: Number(requireEnv('MATCHMAKING_TIMEOUT_MS', '30000')),
     },
 
     /* ===== STOCKFISH ===== */
