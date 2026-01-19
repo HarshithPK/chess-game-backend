@@ -3,6 +3,7 @@ import http from 'http';
 import { app } from './app';
 import { initSocket } from './socket';
 import { initDB } from './db';
+import { startMatchmakingCleanup } from './matchmaking/scheduler';
 
 import { ENV } from './config/env';
 
@@ -14,7 +15,9 @@ async function start() {
     const server = http.createServer(app);
 
     // 🔌 Attach Socket.IO
-    initSocket(server);
+    const io = initSocket(server);
+
+    startMatchmakingCleanup(io);
 
     server.listen(ENV.PORT, () => {
         console.log(`🚀 Backend running on http://localhost:${ENV.PORT}`);

@@ -3,30 +3,35 @@ import type { Server as HttpServer } from 'http';
 
 import { gameStore } from '../game/gameStore';
 import { applyMove } from '../chess/applyMove';
-import { hasAnyLegalMoves, isKingInCheck } from '../chess/moveUtils';
 import { getPositionHash } from '../chess/positionHash';
 import { generateSAN } from '../chess/generateSan';
 import { generatePGN } from '../chess/generatePGN';
-import { isInsufficientMaterial } from '../chess/isInsufficientMaterial';
-import { boardToFEN } from '../chess/boardToFen';
 
-import { createClock } from '../game/timeControls';
 import { applyClock, checkTimeout } from '../game/clockUtils';
-
 import { socketAuth } from '../auth/socketAuth';
 
-import { getEngine, releaseEngine } from '../engine/enginePool';
+import { releaseEngine } from '../engine/enginePool';
 import { analyzeGame } from '../engine/postGameAnalysis';
 
-import { Game, Move } from '../db/models';
+/* MATCHMAKING */
+import { enqueueCasual } from '../matchmaking/enqueue';
+import { tryMatchCasual } from '../matchmaking/tryMatch';
+import { enqueueRanked } from '../matchmaking/enqueueRanked';
+import { tryMatchRanked } from '../matchmaking/tryMatchRanked';
+import { removeUserFromAllQueues } from '../matchmaking/removeUser';
+import { estimateWaitTime } from '../matchmaking/estimateWait';
+
+/* DB */
+import { Game, Move, User } from '../db/models';
 import { ENV } from '../config/env';
 
-/* 🔴 MATCHMAKING */
-import { enqueue, dequeue, removeByUserId } from '../matchmaking/casualQueue';
+/* RATING */
+import { updateElo } from '../rating/elo';
 
 const DISCONNECT_TIMEOUT = ENV.DISCONNECT_TIMEOUT;
 
-/* ========= DB MOVE PERSIST ========= */
+/* ================= DB MOVE PERSIST ================= */
+
 async function persistMove({
     game,
     moveNumber,
@@ -66,6 +71,38 @@ async function persistMove({
     });
 }
 
+/* ================= RANKED RATING ================= */
+
+async function applyRankedRating(game: any) {
+    if (!game.isRanked) return;
+
+    const whiteId = game.players.white?.playerId;
+    const blackId = game.players.black?.playerId;
+    if (!whiteId || !blackId) return;
+
+    const white = await User.findByPk(whiteId);
+    const black = await User.findByPk(blackId);
+    if (!white || !black) return;
+
+    const whiteRating = (white as any).rating ?? 1200;
+    const blackRating = (black as any).rating ?? 1200;
+
+    const whiteScore = game.winner === 'white' ? 1 : game.winner === null ? 0.5 : 0;
+    const blackScore = 1 - whiteScore;
+
+    await white.update({
+        rating: updateElo(whiteRating, blackRating, whiteScore),
+        gamesPlayed: ((white as any).gamesPlayed ?? 0) + 1,
+    } as any);
+
+    await black.update({
+        rating: updateElo(blackRating, whiteRating, blackScore as 0 | 0.5 | 1),
+        gamesPlayed: ((black as any).gamesPlayed ?? 0) + 1,
+    } as any);
+}
+
+/* ================= SOCKET ================= */
+
 export function initSocket(server: HttpServer) {
     const io = new Server(server, {
         cors: {
@@ -78,14 +115,11 @@ export function initSocket(server: HttpServer) {
 
     io.on('connection', (socket) => {
         const userId = socket.data.userId as string;
-        if (!userId) {
-            socket.disconnect();
-            return;
-        }
+        if (!userId) return socket.disconnect();
 
         let currentGameId: string | null = null;
 
-        /* ========= RECONNECT ========= */
+        /* ===== RECONNECT ===== */
         const existingGame = gameStore.findGameByPlayerId(userId);
         if (existingGame) {
             const player =
@@ -103,72 +137,54 @@ export function initSocket(server: HttpServer) {
             }
         }
 
-        /* ========= MATCHMAKING JOIN ========= */
-        socket.on('matchmaking:join', async ({ timeControl }) => {
-            // Try to match immediately
-            const opponent = await dequeue();
+        /* ===== RANKED MATCHMAKING ===== */
+        socket.on('matchmaking:ranked:join', async ({ timeControl }) => {
+            await removeUserFromAllQueues(userId);
 
-            if (opponent && opponent.userId !== userId) {
-                // Create game
-                const game = gameStore.create(opponent.socketId, opponent.userId);
-                game.clock = createClock(timeControl);
-                game.timeControl = timeControl;
+            const user = await User.findByPk(userId);
+            if (!user) return;
 
-                game.players.black = {
-                    playerId: userId,
-                    socketId: socket.id,
-                    color: 'black',
-                };
-
-                game.status = 'active';
-                currentGameId = game.id;
-
-                await Game.create({
-                    id: game.id,
-                    whiteUserId: opponent.userId,
-                    blackUserId: userId,
-                    status: 'active',
-                    timeControl,
-                    clockLastTick: Date.now(),
-                });
-
-                io.to(opponent.socketId).emit('matchmaking:matched', {
-                    gameId: game.id,
-                    color: 'white',
-                });
-
-                socket.emit('matchmaking:matched', {
-                    gameId: game.id,
-                    color: 'black',
-                });
-
-                return;
-            }
-
-            // No opponent → enqueue
-            await enqueue({
+            await enqueueRanked({
                 userId,
-                socketId: socket.id,
+                rating: (user as any).rating ?? 1200,
                 timeControl,
-                joinedAt: Date.now(),
             });
 
-            socket.emit('matchmaking:queued');
+            const match = await tryMatchRanked(timeControl);
+            if (match) {
+                io.to(match.p1).emit('matchmaking:matched', match);
+                io.to(match.p2).emit('matchmaking:matched', match);
+            } else {
+                socket.emit('matchmaking:queued', { ranked: true });
+            }
         });
 
-        /* ========= MATCHMAKING CANCEL ========= */
+        /* ===== CASUAL MATCHMAKING ===== */
+        socket.on('matchmaking:join', async ({ timeControl }) => {
+            await removeUserFromAllQueues(userId);
+
+            await enqueueCasual({ userId, socketId: socket.id, timeControl });
+
+            const estimate = await estimateWaitTime(timeControl);
+            const match = await tryMatchCasual(timeControl);
+
+            if (match) {
+                io.to(match.p1.socketId).emit('matchmaking:matched', match);
+                io.to(match.p2.socketId).emit('matchmaking:matched', match);
+            } else {
+                socket.emit('matchmaking:queued', {
+                    timeControl,
+                    estimatedWait: estimate,
+                });
+            }
+        });
+
         socket.on('matchmaking:cancel', async () => {
-            await removeByUserId(userId);
+            await removeUserFromAllQueues(userId);
             socket.emit('matchmaking:cancelled');
         });
 
-        /* ========= GAME STATE ========= */
-        socket.on('game:state', (gameId: string) => {
-            const game = gameStore.get(gameId);
-            if (game) socket.emit('game:state', game);
-        });
-
-        /* ========= GAME MOVE ========= */
+        /* ===== GAME MOVE ===== */
         socket.on('game:move', async ({ gameId, from, to }) => {
             const game = gameStore.get(gameId);
             if (!game || game.status !== 'active' || game.pendingPromotion) return;
@@ -179,9 +195,9 @@ export function initSocket(server: HttpServer) {
                     : game.players.black?.socketId === socket.id
                       ? 'black'
                       : null;
-
             if (player !== game.turn) return;
 
+            /* ⏱ CLOCK */
             applyClock(game, player);
 
             await Game.update(
@@ -191,11 +207,7 @@ export function initSocket(server: HttpServer) {
 
             const timedOut = checkTimeout(game);
             if (timedOut) {
-                game.status = 'ended';
-                game.endReason = 'timeout';
-                game.winner = timedOut === 'white' ? 'black' : 'white';
-                releaseEngine(game.id);
-                io.to(gameId).emit('game:update', game);
+                await endGame(game, timedOut === 'white' ? 'black' : 'white', 'timeout', io);
                 return;
             }
 
@@ -204,10 +216,15 @@ export function initSocket(server: HttpServer) {
             const boardBefore = game.board.map((sq) => ({ piece: sq.piece }));
 
             const result = applyMove(game, from, to);
+
             if (result.type === 'invalid') return;
 
             if (result.type === 'promotion') {
-                game.pendingPromotion = { index: result.index, color: player, from };
+                game.pendingPromotion = {
+                    index: result.index,
+                    color: player,
+                    from,
+                };
                 socket.emit('game:promotionRequired', { index: result.index });
                 return;
             }
@@ -246,41 +263,46 @@ export function initSocket(server: HttpServer) {
             io.to(gameId).emit('game:update', game);
         });
 
-        /* ========= DISCONNECT ========= */
+        /* ===== DISCONNECT ===== */
         socket.on('disconnect', async () => {
-            await removeByUserId(userId);
-
+            await removeUserFromAllQueues(userId);
             if (!currentGameId) return;
+
             const game = gameStore.get(currentGameId);
             if (!game || game.status !== 'active') return;
 
-            const disconnectedColor =
-                game.players.white?.socketId === socket.id ? 'white' : 'black';
-
-            game.disconnectedColor = disconnectedColor;
-            game.disconnectDeadline = Date.now() + DISCONNECT_TIMEOUT;
+            const color = game.players.white?.socketId === socket.id ? 'white' : 'black';
 
             game.disconnectTimer = setTimeout(async () => {
-                game.status = 'ended';
-                game.endReason = 'disconnect';
-                game.winner = disconnectedColor === 'white' ? 'black' : 'white';
-
-                releaseEngine(game.id);
-                game.analysis = await analyzeGame(game);
-
-                await Game.update(
-                    {
-                        status: 'ended',
-                        winner: game.winner,
-                        endReason: 'disconnect',
-                        analysis: game.analysis,
-                        pgn: generatePGN(game),
-                    },
-                    { where: { id: game.id } }
-                );
-
-                io.to(currentGameId!).emit('game:update', game);
+                await endGame(game, color === 'white' ? 'black' : 'white', 'disconnect', io);
             }, DISCONNECT_TIMEOUT);
         });
     });
+
+    return io;
+}
+
+/* ================= GAME END ================= */
+
+async function endGame(game: any, winner: 'white' | 'black' | null, reason: any, io: Server) {
+    game.status = 'ended';
+    game.winner = winner;
+    game.endReason = reason;
+
+    releaseEngine(game.id);
+    await applyRankedRating(game);
+    game.analysis = await analyzeGame(game);
+
+    await Game.update(
+        {
+            status: 'ended',
+            winner,
+            endReason: reason,
+            analysis: game.analysis,
+            pgn: generatePGN(game),
+        },
+        { where: { id: game.id } }
+    );
+
+    io.to(game.id).emit('game:update', game);
 }

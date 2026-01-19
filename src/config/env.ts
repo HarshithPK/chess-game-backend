@@ -39,6 +39,11 @@ export const ENV = {
         PASSWORD: requireEnv('REDIS_PASSWORD'),
     },
 
+    /* ===== MATCHMAKING ===== */
+    MATCHMAKING: {
+        TIMEOUT: Number(requireEnv('MATCHMAKING_TIMEOUT_MS', '30_000')),
+    },
+
     /* ===== STOCKFISH ===== */
     STOCKFISH: {
         WINDOWS_PATH: requireEnv(
