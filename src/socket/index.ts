@@ -9,6 +9,7 @@ import { generateSAN } from '../chess/generateSan';
 import { generatePGN } from '../chess/generatePGN';
 import { isInsufficientMaterial } from '../chess/isInsufficientMaterial';
 import { boardToFEN } from '../chess/boardToFen';
+
 import { createClock } from '../game/timeControls';
 import { applyClock, checkTimeout } from '../game/clockUtils';
 
@@ -18,8 +19,10 @@ import { getEngine, releaseEngine } from '../engine/enginePool';
 import { analyzeGame } from '../engine/postGameAnalysis';
 
 import { Game, Move } from '../db/models';
-
 import { ENV } from '../config/env';
+
+/* 🔴 MATCHMAKING */
+import { enqueue, dequeue, removeByUserId } from '../matchmaking/casualQueue';
 
 const DISCONNECT_TIMEOUT = ENV.DISCONNECT_TIMEOUT;
 
@@ -48,22 +51,16 @@ async function persistMove({
     await Move.create({
         gameId: game.id,
         moveNumber,
-
         color,
         fromSquare: from,
         toSquare: to,
-
         piece,
         capture,
         promotion: promotion ?? null,
-
         san: san ?? null,
         annotation: null,
-
         evalBefore: null,
         evalAfter: null,
-
-        // ⏱️ CLOCK SNAPSHOT (CRITICAL)
         clockWhite: game.clock.white,
         clockBlack: game.clock.black,
     });
@@ -98,70 +95,83 @@ export function initSocket(server: HttpServer) {
                       ? existingGame.players.black
                       : null;
 
-            if (!player) return;
-
-            player.socketId = socket.id;
-            currentGameId = existingGame.id;
-
-            socket.join(existingGame.id);
-            socket.emit('game:reconnected', existingGame);
+            if (player) {
+                player.socketId = socket.id;
+                currentGameId = existingGame.id;
+                socket.join(existingGame.id);
+                socket.emit('game:reconnected', existingGame);
+            }
         }
 
-        /* ========= STATE ========= */
+        /* ========= MATCHMAKING JOIN ========= */
+        socket.on('matchmaking:join', async ({ timeControl }) => {
+            // Try to match immediately
+            const opponent = await dequeue();
+
+            if (opponent && opponent.userId !== userId) {
+                // Create game
+                const game = gameStore.create(opponent.socketId, opponent.userId);
+                game.clock = createClock(timeControl);
+                game.timeControl = timeControl;
+
+                game.players.black = {
+                    playerId: userId,
+                    socketId: socket.id,
+                    color: 'black',
+                };
+
+                game.status = 'active';
+                currentGameId = game.id;
+
+                await Game.create({
+                    id: game.id,
+                    whiteUserId: opponent.userId,
+                    blackUserId: userId,
+                    status: 'active',
+                    timeControl,
+                    clockLastTick: Date.now(),
+                });
+
+                io.to(opponent.socketId).emit('matchmaking:matched', {
+                    gameId: game.id,
+                    color: 'white',
+                });
+
+                socket.emit('matchmaking:matched', {
+                    gameId: game.id,
+                    color: 'black',
+                });
+
+                return;
+            }
+
+            // No opponent → enqueue
+            await enqueue({
+                userId,
+                socketId: socket.id,
+                timeControl,
+                joinedAt: Date.now(),
+            });
+
+            socket.emit('matchmaking:queued');
+        });
+
+        /* ========= MATCHMAKING CANCEL ========= */
+        socket.on('matchmaking:cancel', async () => {
+            await removeByUserId(userId);
+            socket.emit('matchmaking:cancelled');
+        });
+
+        /* ========= GAME STATE ========= */
         socket.on('game:state', (gameId: string) => {
             const game = gameStore.get(gameId);
             if (game) socket.emit('game:state', game);
         });
 
-        /* ========= CREATE ========= */
-        socket.on('game:create', async () => {
-            const game = gameStore.create(socket.id, userId);
-            game.clock = createClock('5+0');
-            currentGameId = game.id;
-
-            await Game.create({
-                id: game.id,
-                whiteUserId: userId,
-                status: 'waiting',
-                timeControl: '5+0',
-                clockLastTick: Date.now(),
-            });
-
-            const hash = getPositionHash(game.board, game.turn, game.enPassantTarget);
-            game.positionHistory[hash] = 1;
-
-            socket.join(game.id);
-            socket.emit('game:created', game);
-        });
-
-        /* ========= JOIN ========= */
-        socket.on('game:join', async (gameId: string) => {
-            const game = gameStore.join(gameId, socket.id, userId);
-            if (!game) {
-                socket.emit('game:error', 'Unable to join game');
-                return;
-            }
-
-            game.status = 'active';
-            currentGameId = game.id;
-
-            await Game.update(
-                { blackUserId: userId, status: 'active' },
-                { where: { id: game.id } }
-            );
-
-            const hash = getPositionHash(game.board, game.turn, game.enPassantTarget);
-            game.positionHistory[hash] = 1;
-
-            socket.join(game.id);
-            io.to(game.id).emit('game:joined', game);
-        });
-
-        /* ========= MAKE MOVE ========= */
+        /* ========= GAME MOVE ========= */
         socket.on('game:move', async ({ gameId, from, to }) => {
             const game = gameStore.get(gameId);
-            if (!game || game.status !== 'active') return;
-            if (game.pendingPromotion) return;
+            if (!game || game.status !== 'active' || game.pendingPromotion) return;
 
             const player =
                 game.players.white?.socketId === socket.id
@@ -174,7 +184,6 @@ export function initSocket(server: HttpServer) {
 
             applyClock(game, player);
 
-            // Persist lastMoveAt into DB clock_last_tick
             await Game.update(
                 { clockLastTick: game.clock!.lastMoveAt },
                 { where: { id: game.id } }
@@ -185,7 +194,6 @@ export function initSocket(server: HttpServer) {
                 game.status = 'ended';
                 game.endReason = 'timeout';
                 game.winner = timedOut === 'white' ? 'black' : 'white';
-
                 releaseEngine(game.id);
                 io.to(gameId).emit('game:update', game);
                 return;
@@ -193,14 +201,10 @@ export function initSocket(server: HttpServer) {
 
             const movingPiece = game.board[from].piece;
             const capturedPiece = game.board[to].piece ?? null;
-
             const boardBefore = game.board.map((sq) => ({ piece: sq.piece }));
 
             const result = applyMove(game, from, to);
-            if (result.type === 'invalid') {
-                socket.emit('game:error', 'Invalid move');
-                return;
-            }
+            if (result.type === 'invalid') return;
 
             if (result.type === 'promotion') {
                 game.pendingPromotion = { index: result.index, color: player, from };
@@ -222,7 +226,6 @@ export function initSocket(server: HttpServer) {
                 piece: movingPiece!.type,
                 color: player,
                 capture: !!capturedPiece,
-                capturedPiece: capturedPiece?.type,
                 san,
                 boardHash: getPositionHash(game.board, game.turn, game.enPassantTarget),
                 halfMoveClock: game.halfMoveClock,
@@ -239,16 +242,28 @@ export function initSocket(server: HttpServer) {
                 san,
             });
 
-            const nextPlayer = player === 'white' ? 'black' : 'white';
-            game.turn = nextPlayer;
+            game.turn = player === 'white' ? 'black' : 'white';
+            io.to(gameId).emit('game:update', game);
+        });
 
-            const hash = getPositionHash(game.board, game.turn, game.enPassantTarget);
-            game.positionHistory[hash] = (game.positionHistory[hash] ?? 0) + 1;
+        /* ========= DISCONNECT ========= */
+        socket.on('disconnect', async () => {
+            await removeByUserId(userId);
 
-            const endGame = async (winner: 'white' | 'black' | null, reason: any) => {
+            if (!currentGameId) return;
+            const game = gameStore.get(currentGameId);
+            if (!game || game.status !== 'active') return;
+
+            const disconnectedColor =
+                game.players.white?.socketId === socket.id ? 'white' : 'black';
+
+            game.disconnectedColor = disconnectedColor;
+            game.disconnectDeadline = Date.now() + DISCONNECT_TIMEOUT;
+
+            game.disconnectTimer = setTimeout(async () => {
                 game.status = 'ended';
-                game.winner = winner;
-                game.endReason = reason;
+                game.endReason = 'disconnect';
+                game.winner = disconnectedColor === 'white' ? 'black' : 'white';
 
                 releaseEngine(game.id);
                 game.analysis = await analyzeGame(game);
@@ -256,83 +271,16 @@ export function initSocket(server: HttpServer) {
                 await Game.update(
                     {
                         status: 'ended',
-                        winner,
-                        endReason: reason,
-                        pgn: generatePGN(game),
+                        winner: game.winner,
+                        endReason: 'disconnect',
                         analysis: game.analysis,
+                        pgn: generatePGN(game),
                     },
                     { where: { id: game.id } }
                 );
 
-                io.to(gameId).emit('game:update', game);
-            };
-
-            if (game.positionHistory[hash] >= 3) return endGame(null, 'threefold');
-            if (game.halfMoveClock >= 100) return endGame(null, 'fifty-move');
-            if (isInsufficientMaterial(game.board)) return endGame(null, 'insufficient-material');
-
-            const inCheck = isKingInCheck(game.board, nextPlayer);
-            const hasMoves = hasAnyLegalMoves(game.board, nextPlayer, game.enPassantTarget);
-            if (!hasMoves)
-                return endGame(inCheck ? player : null, inCheck ? 'checkmate' : 'stalemate');
-
-            const fen = boardToFEN(game.board, game.turn, game.enPassantTarget);
-            getEngine(game.id)
-                .evaluate(fen)
-                .then((evalResult) => {
-                    io.to(game.id).emit('game:engineEval', evalResult);
-                });
-
-            io.to(gameId).emit('game:update', game);
-        });
-
-        /* ========= PROMOTION ========= */
-        socket.on('game:promote', async ({ gameId, piece }) => {
-            const game = gameStore.get(gameId);
-            if (!game || !game.pendingPromotion) return;
-
-            const { index, color, from } = game.pendingPromotion;
-
-            const boardBefore = game.board.map((sq) => ({ piece: sq.piece }));
-
-            game.board[index].piece = { type: piece, color, hasMoved: true };
-            game.pendingPromotion = null;
-
-            const san = generateSAN(boardBefore, game.board, {
-                from,
-                to: index,
-                piece: 'pawn',
-                color,
-                capture: false,
-                promotion: piece,
-            });
-
-            game.moveHistory.push({
-                from,
-                to: index,
-                piece: 'pawn',
-                color,
-                capture: false,
-                promotion: piece,
-                san,
-                boardHash: getPositionHash(game.board, game.turn, game.enPassantTarget),
-                halfMoveClock: game.halfMoveClock,
-            });
-
-            await persistMove({
-                game,
-                moveNumber: game.moveHistory.length,
-                from,
-                to: index,
-                piece: 'pawn',
-                color,
-                capture: false,
-                promotion: piece,
-                san,
-            });
-
-            game.turn = color === 'white' ? 'black' : 'white';
-            io.to(gameId).emit('game:update', game);
+                io.to(currentGameId!).emit('game:update', game);
+            }, DISCONNECT_TIMEOUT);
         });
     });
 }

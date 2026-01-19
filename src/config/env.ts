@@ -32,10 +32,11 @@ export const ENV = {
         EXPIRES_IN: requireEnv('JWT_EXPIRES_IN', '7d'),
     },
 
-    /* ===== REDIS (matchmaking later) ===== */
+    /* ===== REDIS ===== */
     REDIS: {
         HOST: requireEnv('REDIS_HOST', 'localhost'),
         PORT: Number(requireEnv('REDIS_PORT', '6379')),
+        PASSWORD: requireEnv('REDIS_PASSWORD'),
     },
 
     /* ===== STOCKFISH ===== */
