@@ -11,6 +11,8 @@ import { isInsufficientMaterial } from '../chess/isInsufficientMaterial';
 import { boardToFEN } from '../chess/boardToFen';
 import { createClock } from '../game/timeControls';
 
+import { socketAuth } from '../auth/socketAuth';
+
 import { getEngine, releaseEngine } from '../engine/enginePool';
 import { analyzeGame } from '../engine/postGameAnalysis';
 
@@ -27,9 +29,12 @@ export function initSocket(server: HttpServer) {
         },
     });
 
+    io.use(socketAuth);
+
     io.on('connection', (socket) => {
-        const playerId = socket.handshake.auth.playerId as string;
-        if (!playerId) {
+        const userId = socket.data.userId as string;
+
+        if (!userId) {
             socket.disconnect();
             return;
         }
@@ -37,12 +42,12 @@ export function initSocket(server: HttpServer) {
         let currentGameId: string | null = null;
 
         /* ========= RECONNECT ========= */
-        const existingGame = gameStore.findGameByPlayerId(playerId);
+        const existingGame = gameStore.findGameByPlayerId(userId);
         if (existingGame) {
             const player =
-                existingGame.players.white?.playerId === playerId
+                existingGame.players.white?.playerId === userId
                     ? existingGame.players.white
-                    : existingGame.players.black?.playerId === playerId
+                    : existingGame.players.black?.playerId === userId
                       ? existingGame.players.black
                       : null;
 
@@ -63,7 +68,7 @@ export function initSocket(server: HttpServer) {
 
         /* ========= CREATE ========= */
         socket.on('game:create', () => {
-            const game = gameStore.create(socket.id, playerId);
+            const game = gameStore.create(socket.id, userId);
             game.clock = createClock('5+0'); // default for now
             currentGameId = game.id;
 
@@ -76,7 +81,7 @@ export function initSocket(server: HttpServer) {
 
         /* ========= JOIN ========= */
         socket.on('game:join', (gameId: string) => {
-            const game = gameStore.join(gameId, socket.id, playerId);
+            const game = gameStore.join(gameId, socket.id, userId);
             if (!game) {
                 socket.emit('game:error', 'Unable to join game');
                 return;

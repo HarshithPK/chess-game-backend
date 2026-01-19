@@ -1,5 +1,8 @@
 import express from 'express';
 import cors from 'cors';
+
+import authRoutes from './auth/authRoutes';
+
 import { ENV } from './config/env';
 
 export const app = express();
@@ -16,3 +19,6 @@ app.use(
 app.get('/health', (_, res) => {
     res.json({ ok: true });
 });
+
+// Routes
+app.use('/auth', authRoutes);
