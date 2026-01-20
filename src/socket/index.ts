@@ -84,20 +84,33 @@ async function applyRankedRating(game: any) {
     const black = await User.findByPk(blackId);
     if (!white || !black) return;
 
-    const whiteRating = (white as any).rating ?? 1200;
-    const blackRating = (black as any).rating ?? 1200;
+    // Temporary safe defaults until DB columns exist
+    const whiteRating = white.rating ?? 1200;
+    const blackRating = black.rating ?? 1200;
 
-    const whiteScore = game.winner === 'white' ? 1 : game.winner === null ? 0.5 : 0;
-    const blackScore = 1 - whiteScore;
+    const whiteGames = white.rankedGames ?? 0;
+    const blackGames = black.rankedGames ?? 0;
+
+    // 🎯 Placement games = higher K
+    const whiteK = whiteGames < 10 ? 64 : 32;
+    const blackK = blackGames < 10 ? 64 : 32;
+
+    const whiteScore: 0 | 0.5 | 1 = game.winner === 'white' ? 1 : game.winner === null ? 0.5 : 0;
+
+    const blackScore: 0 | 0.5 | 1 = (1 - whiteScore) as 0 | 0.5 | 1;
+
+    const newWhiteRating = updateElo(whiteRating, blackRating, whiteScore, whiteK);
+
+    const newBlackRating = updateElo(blackRating, whiteRating, blackScore, blackK);
 
     await white.update({
-        rating: updateElo(whiteRating, blackRating, whiteScore),
-        gamesPlayed: ((white as any).gamesPlayed ?? 0) + 1,
+        rating: newWhiteRating,
+        gamesPlayed: whiteGames + 1,
     } as any);
 
     await black.update({
-        rating: updateElo(blackRating, whiteRating, blackScore as 0 | 0.5 | 1),
-        gamesPlayed: ((black as any).gamesPlayed ?? 0) + 1,
+        rating: newBlackRating,
+        gamesPlayed: blackGames + 1,
     } as any);
 }
 
@@ -146,6 +159,7 @@ export function initSocket(server: HttpServer) {
 
             await enqueueRanked({
                 userId,
+                socketId: socket.id,
                 rating: (user as any).rating ?? 1200,
                 timeControl,
             });
@@ -197,7 +211,6 @@ export function initSocket(server: HttpServer) {
                       : null;
             if (player !== game.turn) return;
 
-            /* ⏱ CLOCK */
             applyClock(game, player);
 
             await Game.update(
@@ -216,15 +229,10 @@ export function initSocket(server: HttpServer) {
             const boardBefore = game.board.map((sq) => ({ piece: sq.piece }));
 
             const result = applyMove(game, from, to);
-
             if (result.type === 'invalid') return;
 
             if (result.type === 'promotion') {
-                game.pendingPromotion = {
-                    index: result.index,
-                    color: player,
-                    from,
-                };
+                game.pendingPromotion = { index: result.index, color: player, from };
                 socket.emit('game:promotionRequired', { index: result.index });
                 return;
             }
@@ -290,7 +298,10 @@ async function endGame(game: any, winner: 'white' | 'black' | null, reason: any,
     game.endReason = reason;
 
     releaseEngine(game.id);
+
+    // ⭐ Ranked rating update
     await applyRankedRating(game);
+
     game.analysis = await analyzeGame(game);
 
     await Game.update(

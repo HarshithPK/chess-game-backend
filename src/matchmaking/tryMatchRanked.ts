@@ -1,32 +1,62 @@
 import { redis } from '../redis/client';
-
-const BASE_WINDOW = 50;
-const EXPAND_PER_SEC = 10;
+import { ratingWindow } from './ratingWindow';
+import { isPlacementPlayer } from './isPlacement';
+import { PLACEMENT_GRACE_MS } from './constants';
 
 export async function tryMatchRanked(timeControl: string) {
     const queueKey = `ranked:queue:${timeControl}`;
+    const ratingKey = `ranked:queue:${timeControl}:rating`;
     const timeKey = `ranked:queue:${timeControl}:time`;
 
-    const users = await redis.zrange(queueKey, 0, -1, 'WITHSCORES');
-    if (users.length < 4) return null;
+    const userIds = await redis.zrange(ratingKey, 0, -1);
+    if (userIds.length < 2) return null;
 
-    for (let i = 0; i < users.length; i += 2) {
-        const u1 = users[i];
-        const u2 = users[i + 2];
-        if (!u2) continue;
+    const now = Date.now();
 
-        const rating1 = Number(users[i + 1]);
-        const rating2 = Number(users[i + 3]);
+    for (const userId of userIds) {
+        const [ratingStr, joinedAtStr] = await Promise.all([
+            redis.zscore(ratingKey, userId),
+            redis.zscore(timeKey, userId),
+        ]);
 
-        const joinTime1 = Number(await redis.zscore(timeKey, u1));
-        const waitSec = (Date.now() - joinTime1) / 1000;
+        if (!ratingStr || !joinedAtStr) continue;
 
-        const window = BASE_WINDOW + waitSec * EXPAND_PER_SEC;
+        const rating = Number(ratingStr);
+        const joinedAt = Number(joinedAtStr);
+        const waitMs = now - joinedAt;
 
-        if (Math.abs(rating1 - rating2) <= window) {
-            await redis.multi().zrem(queueKey, u1, u2).zrem(timeKey, u1, u2).exec();
+        const delta = ratingWindow(waitMs);
+        const isPlacement = await isPlacementPlayer(userId);
+        const strictPlacement = isPlacement && waitMs < PLACEMENT_GRACE_MS;
 
-            return { p1: u1, p2: u2 };
+        const candidates = await redis.zrangebyscore(ratingKey, rating - delta, rating + delta);
+
+        for (const opponentId of candidates) {
+            if (opponentId === userId) continue;
+
+            const opponentIsPlacement = await isPlacementPlayer(opponentId);
+
+            // 🔒 Rule 1: Placement-only phase
+            if (strictPlacement && !opponentIsPlacement) continue;
+
+            // 🔒 Rule 2: Non-placement prefers non-placement
+            if (!isPlacement && opponentIsPlacement) continue;
+
+            // ✅ Match found — CLEANUP
+            await redis
+                .multi()
+                .zrem(ratingKey, userId, opponentId)
+                .zrem(timeKey, userId, opponentId)
+                .srem(queueKey, userId, opponentId)
+                .del(`mm:socket:${userId}`, `mm:socket:${opponentId}`)
+                .exec();
+
+            return {
+                p1: userId,
+                p2: opponentId,
+                timeControl,
+                ranked: true,
+            };
         }
     }
 

@@ -1,41 +1,28 @@
 import { DataTypes, Model } from 'sequelize';
-
 import { sequelize } from '../sequelize';
 
-export class User extends Model {
+export class UserRating extends Model {
     declare id: string;
-    declare email: string;
-    declare username: string;
-    declare displayName: string;
-    declare passwordHash: string;
-
+    declare userId: string;
+    declare category: string;
     declare rating: number;
     declare rankedGames: number;
     declare isPlacement: boolean;
 }
 
-User.init(
+UserRating.init(
     {
         id: {
             type: DataTypes.UUID,
             defaultValue: DataTypes.UUIDV4,
             primaryKey: true,
         },
-        email: {
-            type: DataTypes.STRING,
+        userId: {
+            type: DataTypes.UUID,
             allowNull: false,
-            unique: true,
+            field: 'user_id',
         },
-        username: {
-            type: DataTypes.STRING,
-            allowNull: false,
-            unique: true,
-        },
-        displayName: {
-            type: DataTypes.STRING,
-            allowNull: false,
-        },
-        passwordHash: {
+        category: {
             type: DataTypes.STRING,
             allowNull: false,
         },
@@ -44,19 +31,22 @@ User.init(
             allowNull: false,
             defaultValue: 1200,
         },
-
         rankedGames: {
             type: DataTypes.INTEGER,
             allowNull: false,
-            defaultValue: 0,
             field: 'ranked_games',
+            defaultValue: 0,
         },
         isPlacement: {
             type: DataTypes.BOOLEAN,
             allowNull: false,
-            defaultValue: true,
             field: 'is_placement',
+            defaultValue: true,
         },
     },
-    { sequelize, tableName: 'users', timestamps: true, underscored: true }
+    {
+        sequelize,
+        tableName: 'user_ratings',
+        underscored: true,
+    }
 );

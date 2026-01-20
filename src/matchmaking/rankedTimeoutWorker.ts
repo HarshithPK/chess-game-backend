@@ -1,35 +1,27 @@
-import { redis } from '../redis/client';
 import { Server } from 'socket.io';
 
-/**
- * Per-time-control matchmaking timeouts (milliseconds)
- * Single source of truth
- */
-const MATCHMAKING_TIMEOUTS: Record<string, number> = {
-    '3+2': 15_000,
-    '5+0': 30_000,
-    '10+0': 60_000,
-};
+import { redis } from '../redis/client';
+import { RANKED_MATCHMAKING_TIMEOUTS } from './timeouts';
 
-export async function matchmakingTimeoutSweep(io: Server) {
+export async function rankedMatchmakingTimeoutSweep(io: Server) {
     const now = Date.now();
 
-    for (const [timeControl, timeoutMs] of Object.entries(MATCHMAKING_TIMEOUTS)) {
+    for (const [timeControl, timeoutMs] of Object.entries(RANKED_MATCHMAKING_TIMEOUTS)) {
         if (!Number.isFinite(timeoutMs)) {
-            console.error(`❌ Invalid timeout for ${timeControl}:`, timeoutMs);
+            console.error(`❌ Invalid ranked TTL for ${timeControl}`);
             continue;
         }
 
-        const queueKey = `casual:queue:${timeControl}`;
-        const timeKey = `casual:queue:${timeControl}:time`;
+        const queueKey = `ranked:queue:${timeControl}`;
+        const ratingKey = `ranked:queue:${timeControl}:rating`;
+        const timeKey = `ranked:queue:${timeControl}:time`;
 
         const cutoff = now - timeoutMs;
 
-        // 🧹 Find expired users
         const expiredUserIds = await redis.zrangebyscore(timeKey, 0, cutoff);
         if (expiredUserIds.length === 0) continue;
 
-        // 🔍 Resolve socketIds BEFORE deletion
+        // Resolve socket IDs first
         const socketKeys = expiredUserIds.map((u) => `mm:socket:${u}`);
         const socketIds = await redis.mget(...socketKeys);
 
@@ -37,17 +29,19 @@ export async function matchmakingTimeoutSweep(io: Server) {
 
         for (const userId of expiredUserIds) {
             pipeline.srem(queueKey, userId);
+            pipeline.zrem(ratingKey, userId);
             pipeline.zrem(timeKey, userId);
             pipeline.del(`mm:socket:${userId}`);
         }
 
         const result = await pipeline.exec();
-        if (!result) continue; // Redis failure safety
+        if (!result) continue;
 
-        // 📡 Notify users AFTER cleanup
+        // Notify AFTER cleanup
         socketIds.forEach((socketId) => {
             if (socketId) {
                 io.to(socketId).emit('matchmaking:timeout', {
+                    ranked: true,
                     timeControl,
                 });
             }
