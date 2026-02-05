@@ -5,23 +5,26 @@ export async function enqueueRanked({
     socketId,
     rating,
     timeControl,
+    isPlacement,
 }: {
     userId: string;
     socketId: string;
     rating: number;
     timeControl: string;
+    isPlacement: boolean;
 }) {
-    const queueKey = `ranked:queue:${timeControl}`;
-    const ratingKey = `ranked:queue:${timeControl}:rating`;
-    const timeKey = `ranked:queue:${timeControl}:time`;
+    const base = `ranked:queue:${timeControl}`;
 
-    const now = Date.now();
+    const multi = redis.multi();
 
-    await redis
-        .multi()
-        .sadd(queueKey, userId) // O(1) membership
-        .zadd(ratingKey, rating, userId) // rating ordering
-        .zadd(timeKey, now, userId) // TTL tracking
-        .set(`mm:socket:${userId}`, socketId) // timeout notify
-        .exec();
+    multi.sadd(base, userId);
+    multi.zadd(`${base}:rating`, rating, userId);
+    multi.zadd(`${base}:time`, Date.now(), userId);
+    multi.set(`mm:socket:${userId}`, socketId);
+
+    if (isPlacement) {
+        multi.sadd(`${base}:placement`, userId);
+    }
+
+    await multi.exec();
 }

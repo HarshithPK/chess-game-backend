@@ -1,64 +1,95 @@
 import { redis } from '../redis/client';
 import { ratingWindow } from './ratingWindow';
-import { isPlacementPlayer } from './isPlacement';
-import { PLACEMENT_GRACE_MS } from './constants';
 
 export async function tryMatchRanked(timeControl: string) {
-    const queueKey = `ranked:queue:${timeControl}`;
-    const ratingKey = `ranked:queue:${timeControl}:rating`;
-    const timeKey = `ranked:queue:${timeControl}:time`;
-
-    const userIds = await redis.zrange(ratingKey, 0, -1);
-    if (userIds.length < 2) return null;
-
+    const base = `ranked:queue:${timeControl}`;
     const now = Date.now();
 
-    for (const userId of userIds) {
-        const [ratingStr, joinedAtStr] = await Promise.all([
-            redis.zscore(ratingKey, userId),
-            redis.zscore(timeKey, userId),
-        ]);
+    /* ========= LOAD QUEUE ORDERED BY TIME ========= */
 
-        if (!ratingStr || !joinedAtStr) continue;
+    const usersWithTime = await redis.zrange(`${base}:time`, 0, -1, 'WITHSCORES');
 
-        const rating = Number(ratingStr);
-        const joinedAt = Number(joinedAtStr);
-        const waitMs = now - joinedAt;
+    if (usersWithTime.length < 4) return null; // need ≥ 2 players
 
-        const delta = ratingWindow(waitMs);
-        const isPlacement = await isPlacementPlayer(userId);
-        const strictPlacement = isPlacement && waitMs < PLACEMENT_GRACE_MS;
+    const queue: { userId: string; joinedAt: number }[] = [];
+    for (let i = 0; i < usersWithTime.length; i += 2) {
+        queue.push({
+            userId: usersWithTime[i],
+            joinedAt: Number(usersWithTime[i + 1]),
+        });
+    }
 
-        const candidates = await redis.zrangebyscore(ratingKey, rating - delta, rating + delta);
+    /* ========= LOAD RATINGS ========= */
 
-        for (const opponentId of candidates) {
-            if (opponentId === userId) continue;
+    const ratingsRaw = await redis.zrange(`${base}:rating`, 0, -1, 'WITHSCORES');
 
-            const opponentIsPlacement = await isPlacementPlayer(opponentId);
+    const ratingMap = new Map<string, number>();
+    for (let i = 0; i < ratingsRaw.length; i += 2) {
+        ratingMap.set(ratingsRaw[i], Number(ratingsRaw[i + 1]));
+    }
 
-            // 🔒 Rule 1: Placement-only phase
-            if (strictPlacement && !opponentIsPlacement) continue;
+    /* ========= LOAD PLACEMENT FLAGS ========= */
 
-            // 🔒 Rule 2: Non-placement prefers non-placement
-            if (!isPlacement && opponentIsPlacement) continue;
+    const placementSet = `${base}:placement`;
+    const placementFlags = await redis.smismember(placementSet, ...queue.map((q) => q.userId));
 
-            // ✅ Match found — CLEANUP
-            await redis
-                .multi()
-                .zrem(ratingKey, userId, opponentId)
-                .zrem(timeKey, userId, opponentId)
-                .srem(queueKey, userId, opponentId)
-                .del(`mm:socket:${userId}`, `mm:socket:${opponentId}`)
-                .exec();
+    const isPlacement = new Map<string, boolean>();
+    queue.forEach((q, i) => {
+        isPlacement.set(q.userId, placementFlags[i] === 1);
+    });
 
-            return {
-                p1: userId,
-                p2: opponentId,
-                timeControl,
-                ranked: true,
-            };
+    /* ========= MATCHING LOGIC ========= */
+
+    for (let i = 0; i < queue.length; i++) {
+        const a = queue[i];
+        const ratingA = ratingMap.get(a.userId);
+        if (ratingA == null) continue;
+
+        const windowA = ratingWindow(now - a.joinedAt);
+        const aIsPlacement = isPlacement.get(a.userId) ?? false;
+
+        for (let j = i + 1; j < queue.length; j++) {
+            const b = queue[j];
+            const ratingB = ratingMap.get(b.userId);
+            if (ratingB == null) continue;
+
+            const windowB = ratingWindow(now - b.joinedAt);
+            const allowedDiff = Math.min(windowA, windowB);
+
+            const bIsPlacement = isPlacement.get(b.userId) ?? false;
+
+            // 🔒 Placement players match together FIRST
+            if (aIsPlacement !== bIsPlacement) continue;
+
+            if (Math.abs(ratingA - ratingB) <= allowedDiff) {
+                return await finalizeMatch(base, a.userId, b.userId, aIsPlacement && bIsPlacement);
+            }
         }
     }
 
     return null;
+}
+
+/* ========= FINALIZE MATCH ========= */
+
+async function finalizeMatch(base: string, u1: string, u2: string, placementMatch: boolean) {
+    const [s1, s2] = await redis.mget(`mm:socket:${u1}`, `mm:socket:${u2}`);
+
+    const multi = redis.multi();
+
+    for (const u of [u1, u2]) {
+        multi.srem(base, u);
+        multi.zrem(`${base}:rating`, u);
+        multi.zrem(`${base}:time`, u);
+        multi.srem(`${base}:placement`, u);
+        multi.del(`mm:socket:${u}`);
+    }
+
+    await multi.exec();
+
+    return {
+        p1: s1!,
+        p2: s2!,
+        isPlacementMatch: placementMatch,
+    };
 }

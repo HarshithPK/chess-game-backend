@@ -27,8 +27,10 @@ import { ENV } from '../config/env';
 
 /* RATING */
 import { updateElo } from '../rating/elo';
+import { ratingConfidence } from '../rating/ratingConfidence';
 
 const DISCONNECT_TIMEOUT = ENV.DISCONNECT_TIMEOUT;
+const PLACEMENT_GAMES = 10;
 
 /* ================= DB MOVE PERSIST ================= */
 
@@ -84,16 +86,14 @@ async function applyRankedRating(game: any) {
     const black = await User.findByPk(blackId);
     if (!white || !black) return;
 
-    // Temporary safe defaults until DB columns exist
-    const whiteRating = white.rating ?? 1200;
-    const blackRating = black.rating ?? 1200;
+    const whiteRating = white.rating;
+    const blackRating = black.rating;
 
-    const whiteGames = white.rankedGames ?? 0;
-    const blackGames = black.rankedGames ?? 0;
+    const whiteGames = white.rankedGames;
+    const blackGames = black.rankedGames;
 
-    // 🎯 Placement games = higher K
-    const whiteK = whiteGames < 10 ? 64 : 32;
-    const blackK = blackGames < 10 ? 64 : 32;
+    const whiteK = white.isPlacement ? 64 : 32;
+    const blackK = black.isPlacement ? 64 : 32;
 
     const whiteScore: 0 | 0.5 | 1 = game.winner === 'white' ? 1 : game.winner === null ? 0.5 : 0;
 
@@ -103,15 +103,61 @@ async function applyRankedRating(game: any) {
 
     const newBlackRating = updateElo(blackRating, whiteRating, blackScore, blackK);
 
+    const nextWhiteGames = whiteGames + 1;
+    const nextBlackGames = blackGames + 1;
+
     await white.update({
         rating: newWhiteRating,
-        gamesPlayed: whiteGames + 1,
-    } as any);
+        rankedGames: nextWhiteGames,
+        isPlacement: nextWhiteGames < PLACEMENT_GAMES,
+    });
 
     await black.update({
         rating: newBlackRating,
-        gamesPlayed: blackGames + 1,
-    } as any);
+        rankedGames: nextBlackGames,
+        isPlacement: nextBlackGames < PLACEMENT_GAMES,
+    });
+}
+
+/* ================= RATING META ================= */
+
+function attachRatingMeta(game: any) {
+    if (!game.isRanked) return game;
+
+    const whitePlayer = game.players.white;
+    const blackPlayer = game.players.black;
+
+    if (!whitePlayer?.user || !blackPlayer?.user) return game;
+
+    // Attach confidence for both
+    whitePlayer.user.ratingConfidence = ratingConfidence(
+        whitePlayer.user.rankedGames,
+        whitePlayer.user.isPlacement
+    );
+
+    blackPlayer.user.ratingConfidence = ratingConfidence(
+        blackPlayer.user.rankedGames,
+        blackPlayer.user.isPlacement
+    );
+
+    /**
+     * 🔒 Hide opponent rating during placement
+     * Each player sees:
+     *  - their own rating
+     *  - opponent confidence only
+     */
+
+    if (whitePlayer.user.isPlacement) {
+        blackPlayer.user.rating = null;
+        blackPlayer.user.isHidden = true;
+    }
+
+    if (blackPlayer.user.isPlacement) {
+        whitePlayer.user.rating = null;
+        whitePlayer.user.isHidden = true;
+    }
+
+    return game;
 }
 
 /* ================= SOCKET ================= */
@@ -146,7 +192,7 @@ export function initSocket(server: HttpServer) {
                 player.socketId = socket.id;
                 currentGameId = existingGame.id;
                 socket.join(existingGame.id);
-                socket.emit('game:reconnected', existingGame);
+                socket.emit('game:reconnected', attachRatingMeta(existingGame));
             }
         }
 
@@ -160,8 +206,9 @@ export function initSocket(server: HttpServer) {
             await enqueueRanked({
                 userId,
                 socketId: socket.id,
-                rating: (user as any).rating ?? 1200,
+                rating: user.rating,
                 timeControl,
+                isPlacement: user.isPlacement,
             });
 
             const match = await tryMatchRanked(timeControl);
@@ -268,7 +315,7 @@ export function initSocket(server: HttpServer) {
             });
 
             game.turn = player === 'white' ? 'black' : 'white';
-            io.to(gameId).emit('game:update', game);
+            io.to(gameId).emit('game:update', attachRatingMeta(game));
         });
 
         /* ===== DISCONNECT ===== */
@@ -299,7 +346,6 @@ async function endGame(game: any, winner: 'white' | 'black' | null, reason: any,
 
     releaseEngine(game.id);
 
-    // ⭐ Ranked rating update
     await applyRankedRating(game);
 
     game.analysis = await analyzeGame(game);
@@ -315,5 +361,5 @@ async function endGame(game: any, winner: 'white' | 'black' | null, reason: any,
         { where: { id: game.id } }
     );
 
-    io.to(game.id).emit('game:update', game);
+    io.to(game.id).emit('game:update', attachRatingMeta(game));
 }
